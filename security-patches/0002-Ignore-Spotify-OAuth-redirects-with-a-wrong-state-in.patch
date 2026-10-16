@@ -1,7 +1,7 @@
 From 5df2ed2fbdb92b288a17423883381f5f196a2993 Mon Sep 17 00:00:00 2001
 From: hazeldo <haze@lxcamail.com>
 Date: Fri, 16 Oct 2026 20:57:06 +0000
-Subject: [PATCH 2/3] Ignore Spotify OAuth redirects with a wrong state instead
+Subject: [PATCH 2/4] Ignore Spotify OAuth redirects with a wrong state instead
  of aborting
 
 A single request to the loopback /callback/ path without the right state

@@ -1,0 +1,292 @@
+From 4b6a5a689f5fc4cecba8b0ccf656090a672d439e Mon Sep 17 00:00:00 2001
+From: hazeldo <haze@lxcamail.com>
+Date: Fri, 16 Oct 2026 21:03:27 +0000
+Subject: [PATCH 4/4] Do not trust install and backup paths from
+ app_location.json blindly
+
+app_location.json lives in %APPDATA% and can be rewritten by any program
+running as the user. Its currentAppPath was wiped and refilled by
+'MagicChatbox.exe -update', '-rollback' and the restore paths, and its
+backupPath was deleted by '-clearbackup' and copied into the install by
+'-rollback'. When the copy failed with access denied, the updater raised
+its own UAC prompt and repeated the operation elevated, so a user-level
+attacker could have MagicChatbox wipe a protected folder, fill it with
+files from the user-writable update workspace and start them as admin.
+
+The install directory must now contain MagicChatbox.exe and must not be
+a drive root, the Windows directory or a personal/system folder, and the
+backup must live inside MagicChatbox's own data folder. This also stops
+an update from wiping Downloads or Desktop for users who unpacked the
+app directly into one of those folders.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WMSS7CpBx5NLw6UbNJMmE3
+---
+ .../UpdateInstallDirectoryGuardTests.cs       |  55 +++++++
+ .../Classes/DataAndSecurity/UpdateApp.cs      | 151 ++++++++++++++++++
+ 2 files changed, 206 insertions(+)
+ create mode 100644 MagicChatbox.Tests/Core/Updates/UpdateInstallDirectoryGuardTests.cs
+
+diff --git a/MagicChatbox.Tests/Core/Updates/UpdateInstallDirectoryGuardTests.cs b/MagicChatbox.Tests/Core/Updates/UpdateInstallDirectoryGuardTests.cs
+new file mode 100644
+index 0000000..bab073a
+--- /dev/null
++++ b/MagicChatbox.Tests/Core/Updates/UpdateInstallDirectoryGuardTests.cs
+@@ -0,0 +1,55 @@
++using System;
++using System.IO;
++using vrcosc_magicchatbox.Classes.DataAndSecurity;
++using Xunit;
++
++namespace MagicChatbox.Tests.Core.Updates;
++
++public class UpdateInstallDirectoryGuardTests : IDisposable
++{
++    private readonly string _root = Path.Combine(Path.GetTempPath(), "mcb-guard-" + Guid.NewGuid().ToString("N"));
++
++    public UpdateInstallDirectoryGuardTests() => Directory.CreateDirectory(_root);
++
++    public void Dispose()
++    {
++        try { Directory.Delete(_root, true); } catch (IOException) { }
++    }
++
++    [Fact]
++    public void A_dedicated_folder_holding_the_app_is_accepted()
++    {
++        string install = Directory.CreateDirectory(Path.Combine(_root, "MagicChatbox")).FullName;
++        File.WriteAllText(Path.Combine(install, "MagicChatbox.exe"), string.Empty);
++
++        Assert.True(UpdateApp.IsSafeInstallDirectory(install, out _));
++    }
++
++    [Fact]
++    public void A_folder_without_the_app_is_refused()
++    {
++        string other = Directory.CreateDirectory(Path.Combine(_root, "Photos")).FullName;
++
++        Assert.False(UpdateApp.IsSafeInstallDirectory(other, out string reason));
++        Assert.Contains("MagicChatbox.exe", reason);
++    }
++
++    [Fact]
++    public void The_windows_directory_is_refused()
++        => Assert.False(UpdateApp.IsSafeInstallDirectory(
++            Environment.GetFolderPath(Environment.SpecialFolder.System), out _));
++
++    [Fact]
++    public void A_drive_root_is_refused()
++        => Assert.False(UpdateApp.IsSafeInstallDirectory(Path.GetPathRoot(_root), out _));
++
++    [Fact]
++    public void Personal_folders_are_refused_even_when_the_app_was_unpacked_into_them()
++    {
++        Assert.False(UpdateApp.IsSafeInstallDirectory(
++            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), out _));
++        Assert.False(UpdateApp.IsSafeInstallDirectory(
++            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), out _));
++        Assert.False(UpdateApp.IsSafeInstallDirectory(Path.GetTempPath(), out _));
++    }
++}
+diff --git a/vrcosc-magicchatbox/Classes/DataAndSecurity/UpdateApp.cs b/vrcosc-magicchatbox/Classes/DataAndSecurity/UpdateApp.cs
+index a5a1369..50a7532 100644
+--- a/vrcosc-magicchatbox/Classes/DataAndSecurity/UpdateApp.cs
++++ b/vrcosc-magicchatbox/Classes/DataAndSecurity/UpdateApp.cs
+@@ -187,6 +187,116 @@ public class UpdateApp
+         }
+     }
+ 
++    private static bool IsSameOrInside(string path, string root)
++    {
++        string fullPath = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
++        string fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
++        return fullPath.Equals(fullRoot, StringComparison.OrdinalIgnoreCase) ||
++               fullPath.StartsWith(fullRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
++    }
++
++    /// <summary>
++    /// The install directory is wiped before new files are copied in, possibly by an elevated
++    /// process. Its path is read from app_location.json, which any program running as the user can
++    /// rewrite, so it is only trusted when it really looks like a MagicChatbox installation and is
++    /// not a system or personal folder. Without this, editing the JSON and starting
++    /// "MagicChatbox.exe -update" deleted any folder (and, after the UAC prompt the updater raises
++    /// itself, any system folder) and replaced it with files from the user-writable update workspace.
++    /// </summary>
++    public static bool IsSafeInstallDirectory(string? path, out string reason)
++    {
++        reason = string.Empty;
++        if (string.IsNullOrWhiteSpace(path))
++        {
++            reason = "no install directory is known";
++            return false;
++        }
++
++        string fullPath;
++        try
++        {
++            fullPath = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
++        }
++        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
++        {
++            reason = "the install directory path is invalid";
++            return false;
++        }
++
++        string? root = Path.GetPathRoot(fullPath)?.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
++        if (string.IsNullOrEmpty(root) || fullPath.Equals(root, StringComparison.OrdinalIgnoreCase))
++        {
++            reason = $"{fullPath} is a drive root";
++            return false;
++        }
++
++        string windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
++        if (!string.IsNullOrEmpty(windows) && IsSameOrInside(fullPath, windows))
++        {
++            reason = $"{fullPath} is inside the Windows directory";
++            return false;
++        }
++
++        string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
++        string[] protectedFolders =
++        {
++            userProfile,
++            string.IsNullOrEmpty(userProfile) ? string.Empty : Path.Combine(userProfile, "Downloads"),
++            Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
++            Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
++            Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory),
++            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
++            Environment.GetFolderPath(Environment.SpecialFolder.MyMusic),
++            Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
++            Environment.GetFolderPath(Environment.SpecialFolder.MyVideos),
++            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
++            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
++            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
++            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
++            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
++            Environment.GetFolderPath(Environment.SpecialFolder.CommonProgramFiles),
++            Environment.GetFolderPath(Environment.SpecialFolder.CommonProgramFilesX86),
++            Environment.GetFolderPath(Environment.SpecialFolder.Programs),
++            Environment.GetFolderPath(Environment.SpecialFolder.Startup),
++            Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup),
++            Path.GetTempPath()
++        };
++
++        foreach (string folder in protectedFolders)
++        {
++            if (string.IsNullOrWhiteSpace(folder))
++                continue;
++
++            string protectedPath = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
++            if (fullPath.Equals(protectedPath, StringComparison.OrdinalIgnoreCase))
++            {
++                reason = $"{fullPath} is a system or personal folder, not a dedicated MagicChatbox folder";
++                return false;
++            }
++        }
++
++        if (!File.Exists(Path.Combine(fullPath, ExecutableName)))
++        {
++            reason = $"{fullPath} does not contain {ExecutableName}";
++            return false;
++        }
++
++        return true;
++    }
++
++    private bool EnsureSafeInstallDirectory(string operation)
++    {
++        if (IsSafeInstallDirectory(currentAppPath, out string reason))
++            return true;
++
++        Logging.WriteException(
++            new Exception($"{operation} was stopped before touching any files: {reason}. " +
++                          "Put MagicChatbox in its own folder and start it from there."),
++            MSGBox: true,
++            autoclose: true);
++        return false;
++    }
++
+     private static void ClearAndRecreateDirectory(string path, string operationName)
+     {
+         ExecuteWithRetry(() =>
+@@ -777,8 +887,22 @@ public class UpdateApp
+                 {
+                     JObject appLocation = JObject.Parse(settingsJson);
+                     currentAppPath = NormalizePathOrFallback(appLocation["currentAppPath"]?.ToString(), actualCurrentAppPath, requireExistingDirectory: true);
++                    if (!PathsEqual(currentAppPath, actualCurrentAppPath) &&
++                        !IsSafeInstallDirectory(currentAppPath, out string installReason))
++                    {
++                        Logging.WriteInfo($"Ignoring the install path stored in app_location.json: {installReason}.");
++                        currentAppPath = actualCurrentAppPath;
++                    }
++
+                     ResetUpdateWorkspacePaths();
+                     backupPath = NormalizePathOrFallback(appLocation["backupPath"]?.ToString(), defaultBackupPath, requireExistingDirectory: true);
++                    if (!IsSameOrInside(backupPath, dataPath))
++                    {
++                        // The backup is deleted by -clearbackup and copied into the install by
++                        // -rollback, so it may only ever live in MagicChatbox's own data folder.
++                        Logging.WriteInfo($"Ignoring the backup path stored in app_location.json because it is outside {dataPath}.");
++                        backupPath = defaultBackupPath;
++                    }
+                 }
+             }
+             catch (Exception ex) when (ex is Newtonsoft.Json.JsonReaderException || ex is IOException || ex is UnauthorizedAccessException)
+@@ -946,6 +1070,12 @@ public class UpdateApp
+         if (!Directory.Exists(backupPath))
+             return;
+ 
++        if (!IsSameOrInside(backupPath, dataPath) || PathsEqual(backupPath, dataPath))
++        {
++            Logging.WriteInfo($"Refusing to delete backup path {backupPath} because it is not inside {dataPath}.");
++            return;
++        }
++
+         try
+         {
+             ExecuteWithRetry(() =>
+@@ -1106,6 +1236,16 @@ public class UpdateApp
+             UpdateStatus("Backup information found", startUp, 50);
+             JObject appLocation = JObject.Parse(File.ReadAllText(jsonFilePath));
+             string rollbackSourcePath = NormalizePathOrFallback(appLocation["backupPath"]?.ToString(), backupPath, requireExistingDirectory: true);
++            if (!IsSameOrInside(rollbackSourcePath, dataPath))
++            {
++                Logging.WriteInfo($"Ignoring rollback source {rollbackSourcePath} because it is outside {dataPath}.");
++                rollbackSourcePath = backupPath;
++            }
++
++            if (!EnsureSafeInstallDirectory("Rollback"))
++            {
++                return;
++            }
+ 
+             if (!Directory.Exists(rollbackSourcePath))
+             {
+@@ -1265,6 +1405,11 @@ public class UpdateApp
+             ExtractCustomZip(customZipPath);
+         }
+ 
++        if (!EnsureSafeInstallDirectory("The update"))
++        {
++            return;
++        }
++
+         DirectoryInfo currentAppDirectory = new DirectoryInfo(currentAppPath);
+ 
+         try
+@@ -1321,6 +1466,12 @@ public class UpdateApp
+                 return false;
+             }
+ 
++            if (!IsSafeInstallDirectory(currentAppPath, out string reason))
++            {
++                Logging.WriteInfo($"{operationName} skipped: {reason}.");
++                return false;
++            }
++
+             ExecuteWithRetry(() => ClearDirectoryContents(currentAppPath), "Clear installation for restore");
+             ExecuteWithRetry(
+                 () => CopyDirectoryContents(new DirectoryInfo(sourcePath), new DirectoryInfo(currentAppPath)),
+-- 
+2.43.0
+
