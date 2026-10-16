@@ -1,0 +1,68 @@
+From 5df2ed2fbdb92b288a17423883381f5f196a2993 Mon Sep 17 00:00:00 2001
+From: hazeldo <haze@lxcamail.com>
+Date: Fri, 16 Oct 2026 20:57:06 +0000
+Subject: [PATCH 2/3] Ignore Spotify OAuth redirects with a wrong state instead
+ of aborting
+
+A single request to the loopback /callback/ path without the right state
+used to end the sign-in, letting any web page or local process cancel it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WMSS7CpBx5NLw6UbNJMmE3
+---
+ .../Classes/Modules/SpotifyOAuthHandler.cs    | 32 ++++++++++++-------
+ 1 file changed, 20 insertions(+), 12 deletions(-)
+
+diff --git a/vrcosc-magicchatbox/Classes/Modules/SpotifyOAuthHandler.cs b/vrcosc-magicchatbox/Classes/Modules/SpotifyOAuthHandler.cs
+index 3e78d10..bfe57e4 100644
+--- a/vrcosc-magicchatbox/Classes/Modules/SpotifyOAuthHandler.cs
++++ b/vrcosc-magicchatbox/Classes/Modules/SpotifyOAuthHandler.cs
+@@ -71,25 +71,33 @@ public sealed class SpotifyOAuthHandler : IDisposable
+ 
+             _nav.OpenUrl(authUrl);
+ 
+-            var listenerTask = _redirectListener!.GetContextAsync();
+             var timeoutTask = Task.Delay(TimeSpan.FromMinutes(2));
+-            var completed = await Task.WhenAny(listenerTask, timeoutTask).ConfigureAwait(false);
++            HttpListenerContext context;
++            System.Collections.Specialized.NameValueCollection query;
+ 
+-            if (completed == timeoutTask)
++            // Any web page or local process can reach the loopback port while the sign-in is open.
++            // A request without our state is answered and ignored instead of ending the sign-in,
++            // so a stray or hostile request cannot cancel the user's real Spotify redirect.
++            while (true)
+             {
+-                Logging.WriteInfo("Spotify OAuth timed out waiting for browser redirect.");
+-                return SpotifyAuthOutcome.Failure(SpotifyAuthFailureReason.TimedOut);
+-            }
++                var listenerTask = _redirectListener!.GetContextAsync();
++                var completed = await Task.WhenAny(listenerTask, timeoutTask).ConfigureAwait(false);
+ 
+-            var context = await listenerTask.ConfigureAwait(false);
+-            var query = HttpUtility.ParseQueryString(context.Request.Url?.Query ?? string.Empty);
++                if (completed == timeoutTask)
++                {
++                    Logging.WriteInfo("Spotify OAuth timed out waiting for browser redirect.");
++                    return SpotifyAuthOutcome.Failure(SpotifyAuthFailureReason.TimedOut);
++                }
+ 
+-            if (!string.Equals(state, query["state"], StringComparison.Ordinal))
+-            {
+-                Logging.WriteInfo("Spotify OAuth state mismatch.");
++                context = await listenerTask.ConfigureAwait(false);
++                query = HttpUtility.ParseQueryString(context.Request.Url?.Query ?? string.Empty);
++
++                if (string.Equals(state, query["state"], StringComparison.Ordinal))
++                    break;
++
++                Logging.WriteInfo("Spotify OAuth state mismatch; ignoring the request and waiting for the real redirect.");
+                 await SendHtmlResponseAsync(context.Response,
+                     "<h2>MagicChatbox</h2><p>Spotify authorization failed security validation. Please try again.</p>").ConfigureAwait(false);
+-                return SpotifyAuthOutcome.Failure(SpotifyAuthFailureReason.StateMismatch);
+             }
+ 
+             string error = query["error"] ?? string.Empty;
+-- 
+2.43.0
+

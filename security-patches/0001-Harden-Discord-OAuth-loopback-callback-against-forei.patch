@@ -1,0 +1,162 @@
+From 5d22c2693b3e0fd70f69619fc2d1a3b19824dacc Mon Sep 17 00:00:00 2001
+From: hazeldo <haze@lxcamail.com>
+Date: Fri, 16 Oct 2026 20:57:06 +0000
+Subject: [PATCH 1/3] Harden Discord OAuth loopback callback against foreign
+ requests
+
+Require a same-origin Origin header on the fragment POST, cap the body at
+16 KiB with a read timeout, serve the bridge page for every GET, and
+ignore callbacks with a wrong state instead of aborting the sign-in.
+Previously any web page or local process could abort the login with one
+POST or exhaust memory with an unbounded body.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WMSS7CpBx5NLw6UbNJMmE3
+---
+ .../Classes/Modules/DiscordOAuthHandler.cs    | 94 ++++++++++++++++++-
+ 1 file changed, 89 insertions(+), 5 deletions(-)
+
+diff --git a/vrcosc-magicchatbox/Classes/Modules/DiscordOAuthHandler.cs b/vrcosc-magicchatbox/Classes/Modules/DiscordOAuthHandler.cs
+index 76de477..1fb6716 100644
+--- a/vrcosc-magicchatbox/Classes/Modules/DiscordOAuthHandler.cs
++++ b/vrcosc-magicchatbox/Classes/Modules/DiscordOAuthHandler.cs
+@@ -5,6 +5,7 @@ using System.Net;
+ using System.Net.Sockets;
+ using System.Security.Cryptography;
+ using System.Text;
++using System.Threading;
+ using System.Threading.Tasks;
+ using System.Web;
+ using vrcosc_magicchatbox.Classes.DataAndSecurity;
+@@ -26,6 +27,9 @@ public sealed class DiscordOAuthHandler : IDisposable
+         string? Error,
+         string? ErrorDescription);
+ 
++    private const int MaxCallbackBodyChars = 16 * 1024;
++    private static readonly TimeSpan CallbackReadTimeout = TimeSpan.FromSeconds(5);
++
+     private readonly INavigationService _nav;
+     private readonly object _listenerLock = new();
+     private HttpListener? _activeListener;
+@@ -117,6 +121,14 @@ public sealed class DiscordOAuthHandler : IDisposable
+ 
+                 var cbCtx = await ctxTask.ConfigureAwait(false);
+ 
++                if (cbCtx.Request.HttpMethod == "GET")
++                {
++                    // Another request may have reached the listener before Discord's redirect did;
++                    // every GET gets the bridge page so the real redirect still completes.
++                    await SendHtmlResponseAsync(cbCtx.Response, BuildFragmentBridgePage()).ConfigureAwait(false);
++                    continue;
++                }
++
+                 if (cbCtx.Request.HttpMethod != "POST")
+                 {
+                     cbCtx.Response.StatusCode = 204;
+@@ -124,19 +136,32 @@ public sealed class DiscordOAuthHandler : IDisposable
+                     continue;
+                 }
+ 
+-                string body;
+-                using (var reader = new StreamReader(cbCtx.Request.InputStream, Encoding.UTF8))
+-                    body = await reader.ReadToEndAsync().ConfigureAwait(false);
++                // Only the bridge page served from this listener may post the fragment. Any other
++                // web page or local process that reaches the port is turned away without ending
++                // the sign-in, so it can neither abort it nor feed it a token of its own.
++                if (!IsSameOriginCallback(cbCtx.Request))
++                {
++                    Logging.WriteInfo("Discord implicit OAuth: rejected fragment callback from a foreign origin.");
++                    CompleteResponse(cbCtx.Response, HttpStatusCode.Forbidden);
++                    continue;
++                }
++
++                string? body = await ReadBoundedBodyAsync(cbCtx.Request).ConfigureAwait(false);
++                if (body == null)
++                {
++                    CompleteResponse(cbCtx.Response, HttpStatusCode.RequestEntityTooLarge);
++                    continue;
++                }
+ 
+                 var p = HttpUtility.ParseQueryString(body);
+ 
+                 var returnedState = p["state"];
+                 if (!string.Equals(state, returnedState, StringComparison.Ordinal))
+                 {
+-                    Logging.WriteInfo("Discord implicit OAuth: state mismatch on fragment callback.");
++                    Logging.WriteInfo("Discord implicit OAuth: state mismatch on fragment callback; ignoring it.");
+                     await SendHtmlResponseAsync(cbCtx.Response,
+                         "<h2>MagicChatbox</h2><p>Authorization failed: security validation error.</p>").ConfigureAwait(false);
+-                    return new DiscordOAuthAttemptResult(null, false, "state_mismatch", null);
++                    continue;
+                 }
+ 
+                 var error = p["error"];
+@@ -316,6 +341,65 @@ public sealed class DiscordOAuthHandler : IDisposable
+         response.OutputStream.Close();
+     }
+ 
++    private static bool IsSameOriginCallback(HttpListenerRequest request)
++    {
++        string expectedOrigin = new Uri(Core.Constants.DiscordOAuthRedirectUri).GetLeftPart(UriPartial.Authority);
++        string? origin = request.Headers["Origin"];
++        if (string.IsNullOrWhiteSpace(origin))
++            return false;
++
++        if (string.Equals(origin, expectedOrigin, StringComparison.OrdinalIgnoreCase))
++            return true;
++
++        // Browsers may report the loopback IP instead of "localhost" for the same listener.
++        return Uri.TryCreate(origin, UriKind.Absolute, out var originUri)
++               && originUri.Scheme == Uri.UriSchemeHttp
++               && originUri.Port == new Uri(Core.Constants.DiscordOAuthRedirectUri).Port
++               && originUri.IsLoopback;
++    }
++
++    private static async Task<string?> ReadBoundedBodyAsync(HttpListenerRequest request)
++    {
++        if (request.ContentLength64 > MaxCallbackBodyChars)
++            return null;
++
++        using var reader = new StreamReader(request.InputStream, Encoding.UTF8);
++        using var timeout = new CancellationTokenSource(CallbackReadTimeout);
++        var buffer = new char[MaxCallbackBodyChars + 1];
++        int total = 0;
++        try
++        {
++            while (total < buffer.Length)
++            {
++                int read = await reader.ReadAsync(buffer.AsMemory(total, buffer.Length - total), timeout.Token)
++                    .ConfigureAwait(false);
++                if (read == 0)
++                    break;
++                total += read;
++            }
++        }
++        catch (OperationCanceledException)
++        {
++            return null;
++        }
++
++        return total > MaxCallbackBodyChars ? null : new string(buffer, 0, total);
++    }
++
++    private static void CompleteResponse(HttpListenerResponse response, HttpStatusCode statusCode)
++    {
++        try
++        {
++            response.StatusCode = (int)statusCode;
++            response.ContentLength64 = 0;
++            response.Close();
++        }
++        catch (Exception ex) when (ex is IOException or HttpListenerException or ObjectDisposedException)
++        {
++            Logging.WriteInfo($"Discord implicit OAuth: could not complete rejected callback: {ex.Message}");
++        }
++    }
++
+     private static string GenerateStateToken()
+     {
+         var bytes = new byte[32];
+-- 
+2.43.0
+
